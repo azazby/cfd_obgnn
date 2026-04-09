@@ -1,0 +1,9 @@
+tqdm
+numpy
+torch>=2.0
+airfrans
+matplotlib
+lips
+dgl>=2.0
+vtk==9.3.0
+scikit-learn==1.5.0
