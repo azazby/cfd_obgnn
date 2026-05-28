@@ -39,6 +39,7 @@ from checkpoint_utils import (
     list_checkpoints,
 )
 from bump_airfoil_dataset import BumpComboAirfoilDataset
+from path_config import REPO_ROOT, add_path_config_args, load_path_config
 
 submit = False
 
@@ -75,6 +76,7 @@ parser.add_argument( "--bump_train_version",type=str,default=None,
 parser.add_argument( "--lr_decay_start_epoch",type=int,default=6,
     help="Epoch to start decaying rapidly",
 )
+add_path_config_args(parser)
 
 
 if submit:
@@ -84,6 +86,8 @@ else:
 
 
 print(args)
+PATHS = load_path_config(args)
+print(PATHS)
 
 class _TensorizedDatasetIter(object):
     def __init__(self, dataset, dataset2, dataset3, batch_size, batchsize2, batchsize3, device):
@@ -308,9 +312,10 @@ class CoordGNN(nn.Module):
         return torch.cat([out1, out2, out3], dim=1)
 
 class AugmentedSimulator():
-    def __init__(self,benchmark,bump_train_version=None,**kwargs):
+    def __init__(self,benchmark,bump_train_version=None,path_config=None,**kwargs):
         self.name = "AirfRANSSubmission"
         self.benchmark = benchmark
+        self.path_config = path_config or PATHS
 
         self.hparams = kwargs
         use_cuda = torch.cuda.is_available()
@@ -326,8 +331,8 @@ class AugmentedSimulator():
         self.path_to_simulations = benchmark.benchmark_path
         print("path:", self.path_to_simulations)
 
-        self.path_to_bump_simulations = "/home/jlu25/ML4CFD-Offset-based-Graph-Convolution/airfrans_data/bumped_dataset"
-        processed_data_dir = "/orcd/home/002/jlu25/orcd/scratch/airfrans_data/processed"
+        self.path_to_bump_simulations = self.path_config.bumped_dir
+        processed_data_dir = self.path_config.processed_data_dir
         print("Train dataset version:",bump_train_version)
         if bump_train_version is None:
             train_path = os.path.join(processed_data_dir, "processed_train.pt")
@@ -355,7 +360,7 @@ class AugmentedSimulator():
                                         benchmark.train_dataset._attr_names,
                                         bumped_dir=self.path_to_bump_simulations,
                                         split='train_D',
-                                        split_csv= "/home/jlu25/ML4CFD-Offset-based-Graph-Convolution/airfrans_data/bumped_dataset_split.csv")
+                                        split_csv=self.path_config.bumped_split_csv)
             self._save_if_missing("train",    bump_dataset,    training=True)
         else:
             bump_dataset = BumpComboAirfoilDataset(benchmark.train_dataset.name,
@@ -364,7 +369,7 @@ class AugmentedSimulator():
                                         benchmark.train_dataset._attr_names,
                                         bumped_dir=self.path_to_bump_simulations,
                                         split=bump_train_version,
-                                        split_csv= "/home/jlu25/ML4CFD-Offset-based-Graph-Convolution/airfrans_data/bumped_dataset_split.csv")
+                                        split_csv=self.path_config.bumped_split_csv)
             self._save_if_missing("train",    bump_dataset,    training=True)
         
         if submit:         
@@ -376,6 +381,7 @@ class AugmentedSimulator():
         path = self._cache[split_name]                            
         if not os.path.exists(path):                                    
             data = self.process_dataset(dataset, training=training)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp_path = path + ".tmp"
             torch.save(data, tmp_path)
             os.replace(tmp_path, path)  # atomic: corrupt half-written file never survives
@@ -929,10 +935,8 @@ if __name__ == "__main__":
     LOG_PATH = LIPS_PATH + "lips_logs.log"
     BENCHMARK_NAME = "DEFAULT"
 
-    BASE_DIR = '/home/jlu25/ML4CFD-Offset-based-Graph-Convolution'
-    DIRECTORY_NAME = os.path.join(BASE_DIR, 'airfrans_data/Dataset')
-    SCRATCH_DATA_PATH = '/orcd/home/002/jlu25/orcd/scratch/airfrans_data/processed'
-    BENCH_CONFIG_PATH = os.path.join(BASE_DIR, 'src/confAirfoil.ini')
+    DIRECTORY_NAME = PATHS.dataset_dir
+    BENCH_CONFIG_PATH = PATHS.bench_config_path
 
     if not os.path.isdir(DIRECTORY_NAME):
         download_data(root_path=".", directory_name=DIRECTORY_NAME)
@@ -942,7 +946,7 @@ if __name__ == "__main__":
                                 benchmark_name = BENCHMARK_NAME,
                                 log_path = LOG_PATH)
     benchmark.load(path=DIRECTORY_NAME)
-    sim = AugmentedSimulator(benchmark, bump_train_version=args.bump_train_version)
+    sim = AugmentedSimulator(benchmark, bump_train_version=args.bump_train_version, path_config=PATHS)
     # sim.device=device
     sim.train(benchmark.train_dataset)
     tick = time.time()
