@@ -38,6 +38,7 @@ from checkpoint_utils import (
     restore_model_state,
     list_checkpoints,
 )
+from bump_airfoil_dataset import BumpComboAirfoilDataset
 
 submit = False
 
@@ -67,6 +68,12 @@ parser.add_argument("--lr_decay", type=float, default=0.99995)
 parser.add_argument("--gpu", type=int, default=0)
 parser.add_argument( "--checkpoint_dir",type=str,default="./checkpoints",
     help="Directory for saving / loading training checkpoints.",
+)
+parser.add_argument( "--bump_train_version",type=str,default=None,
+    help="Split name for bumped train dataset version.",
+)
+parser.add_argument( "--lr_decay_start_epoch",type=int,default=6,
+    help="Epoch to start decaying rapidly",
 )
 
 
@@ -301,7 +308,7 @@ class CoordGNN(nn.Module):
         return torch.cat([out1, out2, out3], dim=1)
 
 class AugmentedSimulator():
-    def __init__(self,benchmark,**kwargs):
+    def __init__(self,benchmark,bump_train_version=None,**kwargs):
         self.name = "AirfRANSSubmission"
         self.benchmark = benchmark
 
@@ -319,10 +326,16 @@ class AugmentedSimulator():
         self.path_to_simulations = benchmark.benchmark_path
         print("path:", self.path_to_simulations)
 
+        self.path_to_bump_simulations = "/home/jlu25/ML4CFD-Offset-based-Graph-Convolution/airfrans_data/bumped_dataset"
         processed_data_dir = "/orcd/home/002/jlu25/orcd/scratch/airfrans_data/processed"
-
+        print("Train dataset version:",bump_train_version)
+        if bump_train_version is None:
+            train_path = os.path.join(processed_data_dir, "processed_train.pt")
+        else:
+            train_path = os.path.join(processed_data_dir, f"processed_{bump_train_version}.pt")
+        
         self._cache = {                                                     
-            "train": os.path.join(processed_data_dir, "processed_train.pt"),          
+            "train": train_path,          
             "test": os.path.join(processed_data_dir, "processed_test.pt"),            
             "test_ood": os.path.join(processed_data_dir, "processed_test_ood.pt"),
         }  
@@ -332,12 +345,31 @@ class AugmentedSimulator():
             if os.path.exists(tmp_path):
                 print(f"[Cache] Removing stale tmp file: {tmp_path}")
                 os.remove(tmp_path) 
-        if submit:         
+        
+        if bump_train_version is None:
             self._save_if_missing("train",    benchmark.train_dataset,    training=True)
+        elif bump_train_version == 'all_bumps':
+            bump_dataset = BumpComboAirfoilDataset(benchmark.train_dataset.name,
+                                        dict(), 
+                                        dict(),
+                                        benchmark.train_dataset._attr_names,
+                                        bumped_dir=self.path_to_bump_simulations,
+                                        split='train_D',
+                                        split_csv= "/home/jlu25/ML4CFD-Offset-based-Graph-Convolution/airfrans_data/bumped_dataset_split.csv")
+            self._save_if_missing("train",    bump_dataset,    training=True)
+        else:
+            bump_dataset = BumpComboAirfoilDataset(benchmark.train_dataset.name,
+                                        benchmark.train_dataset.data, 
+                                        benchmark.train_dataset.extra_data,
+                                        benchmark.train_dataset._attr_names,
+                                        bumped_dir=self.path_to_bump_simulations,
+                                        split=bump_train_version,
+                                        split_csv= "/home/jlu25/ML4CFD-Offset-based-Graph-Convolution/airfrans_data/bumped_dataset_split.csv")
+            self._save_if_missing("train",    bump_dataset,    training=True)
+        
+        if submit:         
             self._save_if_missing("test",     benchmark._test_dataset,    training=False)
             self._save_if_missing("test_ood", benchmark._test_ood_dataset, training=False)
-        else: 
-            self._save_if_missing("train", benchmark.train_dataset, training=True)
     
     def _save_if_missing(self, split_name, dataset, training):         
         """Process a split and save it if its cache file does not yet exist.""" 
@@ -357,7 +389,6 @@ class AugmentedSimulator():
         self._save_if_missing(split_name, dataset, training=training)
         return torch.load(path)   
 
-       
     def process_dataset(self, dataset, training: bool):
         name = dataset.name
         simulation_names = dataset.extra_data['simulation_names']
@@ -378,18 +409,27 @@ class AugmentedSimulator():
             y_pos = torch.tensor(dataset.data["y-position"][p:p+size]).to(torch.float32)
 
             pos = torch.stack([x_pos, y_pos], dim=1)
-            path = os.path.join(self.path_to_simulations, name, name+"_internal.vtu")
-            reader = vtkmodules.vtkIOXML.vtkXMLUnstructuredGridReader()
-            reader.SetFileName(path)
-            reader.Update()
-            unstructured_grid = reader.GetOutput()
-            # 获取单元格数据
-            cells = unstructured_grid.GetCells().GetData()
-            cells = vtkmodules.util.numpy_support.vtk_to_numpy(cells).reshape(-1, 5)
-            cells[:, 0] = cells[: , 4]
+            # update edges for bumped airfoils
+            if name.split('_')[0]=='bump':
+                path = os.path.join(self.path_to_bump_simulations, (name+".npz"))
+                bump_data = np.load(path, allow_pickle=True)
+                edges = bump_data['undirected edges']
+                srcs = torch.tensor(edges[:,0].flatten())
+                dsts = torch.tensor(edges[:,1].flatten())
 
-            srcs = torch.tensor(cells[:, :4].flatten())
-            dsts = torch.tensor(cells[:, 1:].flatten())
+            else:
+                path = os.path.join(self.path_to_simulations, name, name+"_internal.vtu")
+                reader = vtkmodules.vtkIOXML.vtkXMLUnstructuredGridReader()
+                reader.SetFileName(path)
+                reader.Update()
+                unstructured_grid = reader.GetOutput()
+                # 获取单元格数据
+                cells = unstructured_grid.GetCells().GetData()
+                cells = vtkmodules.util.numpy_support.vtk_to_numpy(cells).reshape(-1, 5)
+                cells[:, 0] = cells[: , 4]
+
+                srcs = torch.tensor(cells[:, :4].flatten())
+                dsts = torch.tensor(cells[:, 1:].flatten())
 
             surface = torch.tensor(dataset.extra_data["surface"][p:p+size]).to(bool)
             surface_pos = pos[surface]
@@ -439,7 +479,7 @@ class AugmentedSimulator():
 
             for feat_name in ["distance_function","x-normals","y-normals"]:
                 graph.ndata[feat_name] = torch.tensor(dataset.data[feat_name][p:p+size]).to(torch.float32)
-            for target_name in ["x-velocity","y-velocity","pressure","turbulent_viscosity"]:
+            for target_name in target_names:
                 graph.ndata[target_name] = torch.tensor(dataset.data[target_name][p:p+size]).to(torch.float32)
 
             features = []
@@ -468,8 +508,17 @@ class AugmentedSimulator():
             # distances = distances.flatten()
             surface_normal = torch.stack((graph.ndata["x-normals"][surface], graph.ndata["y-normals"][surface]), dim = 1)
             normal = surface_normal[indices]
-            normal[indices==0] = coord[indices==0]
-            normal[indices==0] = -1*normal[indices==0] / (normal[indices==0].norm(p=2, dim=1, keepdim=True)+1e-8)
+            # original code: relies on ordering of surface nodes for indices==0 to be meaningful
+            # normal[indices==0] = coord[indices==0]
+            # normal[indices==0] = -1*normal[indices==0] / (normal[indices==0].norm(p=2, dim=1, keepdim=True)+1e-8)
+            # hack: airfrans tail node at pos (1,0) is always at index 0
+            # in bumped dataset tail node is always at index 1
+            hack_idx = 0
+            if name.split('_')[0]=='bump':
+                hack_idx = 1
+            mask = (indices == hack_idx)
+            normal[mask] = coord[mask]
+            normal[mask] = -1*normal[mask] / (normal[mask].norm(p=2, dim=1, keepdim=True)+1e-8)
             normal_dir = np.arctan2(normal[:, 1], normal[:, 0])
             offset = coord - surface_coord[indices]
             offset_dir = offset / (offset.norm(p=2, dim=1, keepdim=True)+0.000000001)
@@ -756,109 +805,109 @@ def global_train(device, graphs, shape_features, means, stds, test_dataset=None,
         # Determine which epoch to start from for this bagging round      
         epoch_start = start_epoch if bagging_i == start_bagging else 0  
         
-        # for epoch in range(epoch_start, args.epochs):
-        #     inner_models = [model.train() for model in inner_models]
-        #     total_loss = 0
-        #     print("Epoch:", epoch, "starts.")
-        #     tick = time.time()
-        #     for it, (input_nodes, output_nodes, blocks) in enumerate(train_dataloader):
-        #         if epoch==0 and it==0:
-        #             print(blocks)
-        #         blocks = [block.to(device) for block in blocks]
-        #         x = blocks[0].srcdata["features"].to(device).to(torch.float32)
-        #         x_shape = torch.index_select(shape_features, 0, blocks[0].srcdata["sim_ids"].to(device))
-        #         x = torch.cat([x, x_shape], dim=1)
-        #         y = blocks[1].dstdata["targets"].to(device).to(torch.float32)
-        #         surface_mask = blocks[1].dstdata["features"][:, 8]>0.5
-        #         for inner_bagging_i in range(args.k):
-        #             model = inner_models[inner_bagging_i]
-        #             optimizer = optimizers[inner_bagging_i]
-        #             lr_scheduler = lr_schedulers[inner_bagging_i]
-        #             y_hat = model(blocks, x)
-        #             loss, losses = LossFn(y_hat, y, surface_mask, blocks[1].dstdata["sim_ids"], means, stds, square=epoch>-1, train=True)
-        #             optimizer.zero_grad()
-        #             loss.backward()
-        #             torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
-        #             optimizer.step()
-        #             optimizer.zero_grad()
-        #             total_loss += loss.item()
-        #             if running_mean_loss>500:
-        #                 running_mean_loss = loss.item()
-        #                 running_mean_losses = [t for t in losses]
-        #             else:
-        #                 running_mean_loss = loss.item()*0.001 + running_mean_loss * 0.999
-        #                 running_mean_losses = [t*0.001 + r*0.999 for t,r in zip(losses, running_mean_losses)]
-        #             if epoch>=6:
-        #                 lr_scheduler.step()
-        #         if it > args.steps:
-        #             break
-        #         if it % 500 == 0:
-        #             print("    Iteration {:05d}/{:05d} | Train Loss: {:.4f} \t| Detailed losses:{:.3f} {:.3f} {:.3f} {:.3f} {:.3f}, {:.3f}".format(it, len(train_dataloader), running_mean_loss, *running_mean_losses), flush=True)
+        for epoch in range(epoch_start, args.epochs):
+            inner_models = [model.train() for model in inner_models]
+            total_loss = 0
+            print("Epoch:", epoch, "starts.")
+            tick = time.time()
+            for it, (input_nodes, output_nodes, blocks) in enumerate(train_dataloader):
+                if epoch==0 and it==0:
+                    print(blocks)
+                blocks = [block.to(device) for block in blocks]
+                x = blocks[0].srcdata["features"].to(device).to(torch.float32)
+                x_shape = torch.index_select(shape_features, 0, blocks[0].srcdata["sim_ids"].to(device))
+                x = torch.cat([x, x_shape], dim=1)
+                y = blocks[1].dstdata["targets"].to(device).to(torch.float32)
+                surface_mask = blocks[1].dstdata["features"][:, 8]>0.5
+                for inner_bagging_i in range(args.k):
+                    model = inner_models[inner_bagging_i]
+                    optimizer = optimizers[inner_bagging_i]
+                    lr_scheduler = lr_schedulers[inner_bagging_i]
+                    y_hat = model(blocks, x)
+                    loss, losses = LossFn(y_hat, y, surface_mask, blocks[1].dstdata["sim_ids"], means, stds, square=epoch>-1, train=True)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    total_loss += loss.item()
+                    if running_mean_loss>500:
+                        running_mean_loss = loss.item()
+                        running_mean_losses = [t for t in losses]
+                    else:
+                        running_mean_loss = loss.item()*0.001 + running_mean_loss * 0.999
+                        running_mean_losses = [t*0.001 + r*0.999 for t,r in zip(losses, running_mean_losses)]
+                    if epoch>=args.lr_decay_start_epoch:
+                        lr_scheduler.step()
+                if it > args.steps:
+                    break
+                if it % 500 == 0:
+                    print("    Iteration {:05d}/{:05d} | Train Loss: {:.4f} \t| Detailed losses:{:.3f} {:.3f} {:.3f} {:.3f} {:.3f}, {:.3f}".format(it, len(train_dataloader), running_mean_loss, *running_mean_losses), flush=True)
 
-        #     tock = time.time()
-        #     print("Epoch {:05d} | Train Loss:{:.4f} Time:{:.2f}".format(epoch, total_loss / (it + 1), tock-tick), flush=True)
+            tock = time.time()
+            print("Epoch {:05d} | Train Loss:{:.4f} Time:{:.2f}".format(epoch, total_loss / (it + 1), tock-tick), flush=True)
 
-        #     # ── Save checkpoint at the end of every epoch ────────────────── 
-        #     save_checkpoint(                                                  
-        #         checkpoint_dir=checkpoint_dir,                            
-        #         bagging_i=bagging_i,                             
-        #         epoch=epoch,                                    
-        #         models=inner_models,                                     
-        #         optimizers=optimizers,                                  
-        #         lr_schedulers=lr_schedulers,                               
-        #         running_mean_loss=running_mean_loss,                      
-        #         running_mean_losses=running_mean_losses,                
-        #         extra={"args": vars(args)},                             
-        #     )                                                         
-        #     # ───────────────────────────────────────────────────────────────
+            # ── Save checkpoint at the end of every epoch ────────────────── 
+            save_checkpoint(                                                  
+                checkpoint_dir=checkpoint_dir,                            
+                bagging_i=bagging_i,                             
+                epoch=epoch,                                    
+                models=inner_models,                                     
+                optimizers=optimizers,                                  
+                lr_schedulers=lr_schedulers,                               
+                running_mean_loss=running_mean_loss,                      
+                running_mean_losses=running_mean_losses,                
+                extra={"args": vars(args)},                             
+            )                                                         
+            # ───────────────────────────────────────────────────────────────
 
-            # with torch.no_grad():
-                # inner_models = [model.eval() for model in inner_models]
-            #     if test_dataset:
-            #         total_loss = 0
-            #         # running_mean_loss = 1000
-            #         losses_list = []
-            #         for it, (input_nodes, output_nodes, blocks) in enumerate(test_dataloader):
-            #             blocks = [block.to(device) for block in blocks]
-            #             x = blocks[0].srcdata["features"].to(device).to(torch.float32)
-            #             x_shape = test_shape_feats[blocks[0].srcdata["sim_ids"].to(device)]
-            #             x = torch.cat([x, x_shape], dim=1)
-            #             y = blocks[-1].dstdata["targets"].to(device).to(torch.float32)
-            #             surface_mask = blocks[1].dstdata["features"][:, 8]>0.5
-            #             y_hats = []
-            #             for inner_bagging_i in range(args.k):
-            #                 model = inner_models[inner_bagging_i]
-            #                 y_hats.append(model(blocks, x))
-            #             y_hat = torch.stack(y_hats, dim=0).mean(dim=0)
-            #             loss, losses = LossFn(y_hat, y, surface_mask, blocks[-1].dstdata["sim_ids"], test_means, test_stds)
-            #             losses_list.append(losses)
-            #             total_loss += loss.item() 
-            #             if it>300:
-            #                 break
-            #         print("  Test set loss:", total_loss/(it+1), np.array(losses_list).mean(axis=0), flush=True)
-            #     if test_ood_dataset:
-            #         total_loss = 0
-            #         losses_list = []
-            #         # running_mean_loss = 1000
-            #         for it, (input_nodes, output_nodes, blocks) in enumerate(test_ood_dataloader):
-            #             blocks = [block.to(device) for block in blocks]
-            #             x = blocks[0].srcdata["features"].to(device).to(torch.float32)
-            #             x_shape = test_ood_shape_feats[blocks[0].srcdata["sim_ids"].to(device)]
-            #             x = torch.cat([x, x_shape], dim=1)
-            #             y = blocks[-1].dstdata["targets"].to(device).to(torch.float32)
-            #             surface_mask = blocks[1].dstdata["features"][:, 8]>0.5
-            #             y_hats = []
-            #             for inner_bagging_i in range(args.k):
-            #                 model = inner_models[inner_bagging_i]
-            #                 y_hats.append(model(blocks, x))
-            #             y_hat = torch.stack(y_hats, dim=0).mean(dim=0)
-            #             loss, losses = LossFn(y_hat, y, surface_mask, blocks[-1].dstdata["sim_ids"], test_ood_means, test_ood_stds)
-            #             losses_list.append(losses)
-            #             total_loss += loss.item() 
-            #             if it>300:
-            #                 break
-            #         print("  Test OOD set loss:", total_loss/(it+1), np.array(losses_list).mean(axis=0), flush=True)
-            #         print()
+            with torch.no_grad():
+                inner_models = [model.eval() for model in inner_models]
+                if test_dataset:
+                    total_loss = 0
+                    # running_mean_loss = 1000
+                    losses_list = []
+                    for it, (input_nodes, output_nodes, blocks) in enumerate(test_dataloader):
+                        blocks = [block.to(device) for block in blocks]
+                        x = blocks[0].srcdata["features"].to(device).to(torch.float32)
+                        x_shape = test_shape_feats[blocks[0].srcdata["sim_ids"].to(device)]
+                        x = torch.cat([x, x_shape], dim=1)
+                        y = blocks[-1].dstdata["targets"].to(device).to(torch.float32)
+                        surface_mask = blocks[1].dstdata["features"][:, 8]>0.5
+                        y_hats = []
+                        for inner_bagging_i in range(args.k):
+                            model = inner_models[inner_bagging_i]
+                            y_hats.append(model(blocks, x))
+                        y_hat = torch.stack(y_hats, dim=0).mean(dim=0)
+                        loss, losses = LossFn(y_hat, y, surface_mask, blocks[-1].dstdata["sim_ids"], test_means, test_stds)
+                        losses_list.append(losses)
+                        total_loss += loss.item() 
+                        if it>300:
+                            break
+                    print("  Test set loss:", total_loss/(it+1), np.array(losses_list).mean(axis=0), flush=True)
+                if test_ood_dataset:
+                    total_loss = 0
+                    losses_list = []
+                    # running_mean_loss = 1000
+                    for it, (input_nodes, output_nodes, blocks) in enumerate(test_ood_dataloader):
+                        blocks = [block.to(device) for block in blocks]
+                        x = blocks[0].srcdata["features"].to(device).to(torch.float32)
+                        x_shape = test_ood_shape_feats[blocks[0].srcdata["sim_ids"].to(device)]
+                        x = torch.cat([x, x_shape], dim=1)
+                        y = blocks[-1].dstdata["targets"].to(device).to(torch.float32)
+                        surface_mask = blocks[1].dstdata["features"][:, 8]>0.5
+                        y_hats = []
+                        for inner_bagging_i in range(args.k):
+                            model = inner_models[inner_bagging_i]
+                            y_hats.append(model(blocks, x))
+                        y_hat = torch.stack(y_hats, dim=0).mean(dim=0)
+                        loss, losses = LossFn(y_hat, y, surface_mask, blocks[-1].dstdata["sim_ids"], test_ood_means, test_ood_stds)
+                        losses_list.append(losses)
+                        total_loss += loss.item() 
+                        if it>300:
+                            break
+                    print("  Test OOD set loss:", total_loss/(it+1), np.array(losses_list).mean(axis=0), flush=True)
+                    print()
                 # inner_models = [model.train() for model in inner_models]
         inner_models = [model.to("cpu").eval() for model in inner_models]
         models.extend(inner_models)
@@ -893,7 +942,7 @@ if __name__ == "__main__":
                                 benchmark_name = BENCHMARK_NAME,
                                 log_path = LOG_PATH)
     benchmark.load(path=DIRECTORY_NAME)
-    sim = AugmentedSimulator(benchmark)
+    sim = AugmentedSimulator(benchmark, bump_train_version=args.bump_train_version)
     # sim.device=device
     sim.train(benchmark.train_dataset)
     tick = time.time()
